@@ -1,1 +1,6 @@
 sample-controller
+/vendor/
+/.idea/.gitignore
+/.idea/modules.xml
+/.idea/sample-controller.iml
+/.idea/vcs.xml

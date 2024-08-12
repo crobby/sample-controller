@@ -94,6 +94,11 @@ func (in *FooSpec) DeepCopyInto(out *FooSpec) {
 		*out = new(int32)
 		**out = **in
 	}
+	if in.IDs != nil {
+		in, out := &in.IDs, &out.IDs
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	return
 }
 
