@@ -3,9 +3,6 @@ kind: Foo
 metadata:
   name: example-foo
 spec:
-  deploymentName: example-foo
-  replicas: 1
   IDs:
     - id1
-    - id2
-
+    - id3
