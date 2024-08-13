@@ -19,13 +19,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"k8s.io/utils/strings/slices"
 	"time"
 
 	"golang.org/x/time/rate"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -47,6 +47,9 @@ import (
 )
 
 const controllerAgentName = "sample-controller"
+
+// Indexer for use in demonstrating errors
+const fooIndex = "test.test.io/fooByID"
 
 const (
 	// SuccessSynced is used as part of the Event 'reason' when a Foo is synced
@@ -74,6 +77,7 @@ type Controller struct {
 	deploymentsSynced cache.InformerSynced
 	foosLister        listers.FooLister
 	foosSynced        cache.InformerSynced
+	foosIndexer       cache.Indexer
 
 	// workqueue is a rate limited work queue. This is used to queue work to be
 	// processed instead of performing it as soon as a change happens. This
@@ -110,6 +114,15 @@ func NewController(
 		&workqueue.BucketRateLimiter{Limiter: rate.NewLimiter(rate.Limit(50), 300)},
 	)
 
+	fooIndexers := map[string]cache.IndexFunc{
+		fooIndex: fooByID,
+	}
+
+	err := fooInformer.Informer().AddIndexers(fooIndexers)
+	if err != nil {
+		klog.Errorf("Failed to add indexer, %s", err.Error())
+	}
+
 	controller := &Controller{
 		kubeclientset:     kubeclientset,
 		sampleclientset:   sampleclientset,
@@ -119,6 +132,7 @@ func NewController(
 		foosSynced:        fooInformer.Informer().HasSynced,
 		workqueue:         workqueue.NewRateLimitingQueue(ratelimiter),
 		recorder:          recorder,
+		foosIndexer:       fooInformer.Informer().GetIndexer(),
 	}
 
 	logger.Info("Setting up event handlers")
@@ -151,6 +165,32 @@ func NewController(
 	})
 
 	return controller
+}
+
+func fooByID(obj interface{}) ([]string, error) {
+	foo, ok := obj.(*samplev1alpha1.Foo)
+	if !ok {
+		return []string{}, nil
+	}
+	validValues := make([]string, 0)
+	for _, value := range foo.Spec.IDs {
+		validValues = append(validValues, value)
+	}
+	return validValues, nil
+}
+
+func (c *Controller) canFetchCorrectFooByID(iDValue string) (bool, *samplev1alpha1.Foo) {
+	// if we get an object and can confirm that it is a foo, then we are good
+	objs, err := c.foosIndexer.ByIndex(fooIndex, iDValue)
+	if err != nil {
+		klog.Errorf("Error retrieving indexed value %s", err.Error())
+		return false, nil
+	}
+	if len(objs) == 0 {
+		return false, nil
+	}
+	foo, ok := objs[0].(*samplev1alpha1.Foo)
+	return ok, foo
 }
 
 // Run will set up the event handlers for types we are interested in, as well
@@ -253,83 +293,36 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 // converge the two. It then updates the Status block of the Foo resource
 // with the current status of the resource.
 func (c *Controller) syncHandler(ctx context.Context, key string) error {
-	// Convert the namespace/name string into a distinct namespace and name
-	logger := klog.LoggerWithValues(klog.FromContext(ctx), "resourceName", key)
+	// At each sync, perform lookups by id1, id2, and id3
+	// if running the makefoos.sh script, example-foo will always have id1.  It will also have either id2 or id3 at
+	// different times.
+	// If we ever manage to get a lookup by ID<n> where the object returned DOES NOT contain ID<n>,
+	// then we have reproduced the behavior that we are seeing in rancher/rancher.
 
-	namespace, name, err := cache.SplitMetaNamespaceKey(key)
-	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("invalid resource key: %s", key))
-		return nil
+	canFetchFoo, returnedFoo := c.canFetchCorrectFooByID("id1")
+	//klog.Infof("Result of indexer for fooID id1, %t, fooName=%s", canFetchFoo, showFooName(returnedFoo))
+	if canFetchFoo && !slices.Contains(returnedFoo.Spec.IDs, "id1") {
+		klog.Errorf("Indexer returned incorrect foo for id1 fooIDs=%s", returnedFoo.Spec.IDs)
+	}
+	canFetchFoo, returnedFoo = c.canFetchCorrectFooByID("id2")
+	//klog.Infof("Result of indexer for fooID id2, %t, fooName=%s", canFetchFoo, showFooName(returnedFoo))
+	if canFetchFoo && !slices.Contains(returnedFoo.Spec.IDs, "id2") {
+		klog.Errorf("Indexer returned incorrect foo for id2 fooIDs=%s", returnedFoo.Spec.IDs)
+	}
+	canFetchFoo, returnedFoo = c.canFetchCorrectFooByID("id3")
+	//klog.Infof("Result of indexer for fooID id3, %t, fooName=%s", canFetchFoo, showFooName(returnedFoo))
+	if canFetchFoo && !slices.Contains(returnedFoo.Spec.IDs, "id3") {
+		klog.Errorf("Indexer returned incorrect foo for id3 fooIDs=%s", returnedFoo.Spec.IDs)
 	}
 
-	// Get the Foo resource with this namespace/name
-	foo, err := c.foosLister.Foos(namespace).Get(name)
-	if err != nil {
-		// The Foo resource may no longer exist, in which case we stop
-		// processing.
-		if errors.IsNotFound(err) {
-			utilruntime.HandleError(fmt.Errorf("foo '%s' in work queue no longer exists", key))
-			return nil
-		}
-
-		return err
-	}
-
-	deploymentName := foo.Spec.DeploymentName
-	if deploymentName == "" {
-		// We choose to absorb the error here as the worker would requeue the
-		// resource otherwise. Instead, the next time the resource is updated
-		// the resource will be queued again.
-		utilruntime.HandleError(fmt.Errorf("%s: deployment name must be specified", key))
-		return nil
-	}
-
-	// Get the deployment with the name specified in Foo.spec
-	deployment, err := c.deploymentsLister.Deployments(foo.Namespace).Get(deploymentName)
-	// If the resource doesn't exist, we'll create it
-	if errors.IsNotFound(err) {
-		deployment, err = c.kubeclientset.AppsV1().Deployments(foo.Namespace).Create(context.TODO(), newDeployment(foo), metav1.CreateOptions{})
-	}
-
-	// If an error occurs during Get/Create, we'll requeue the item so we can
-	// attempt processing again later. This could have been caused by a
-	// temporary network failure, or any other transient reason.
-	if err != nil {
-		return err
-	}
-
-	// If the Deployment is not controlled by this Foo resource, we should log
-	// a warning to the event recorder and return error msg.
-	if !metav1.IsControlledBy(deployment, foo) {
-		msg := fmt.Sprintf(MessageResourceExists, deployment.Name)
-		c.recorder.Event(foo, corev1.EventTypeWarning, ErrResourceExists, msg)
-		return fmt.Errorf("%s", msg)
-	}
-
-	// If this number of the replicas on the Foo resource is specified, and the
-	// number does not equal the current desired replicas on the Deployment, we
-	// should update the Deployment resource.
-	if foo.Spec.Replicas != nil && *foo.Spec.Replicas != *deployment.Spec.Replicas {
-		logger.V(4).Info("Update deployment resource", "currentReplicas", *foo.Spec.Replicas, "desiredReplicas", *deployment.Spec.Replicas)
-		deployment, err = c.kubeclientset.AppsV1().Deployments(foo.Namespace).Update(context.TODO(), newDeployment(foo), metav1.UpdateOptions{})
-	}
-
-	// If an error occurs during Update, we'll requeue the item so we can
-	// attempt processing again later. This could have been caused by a
-	// temporary network failure, or any other transient reason.
-	if err != nil {
-		return err
-	}
-
-	// Finally, we update the status block of the Foo resource to reflect the
-	// current state of the world
-	err = c.updateFooStatus(foo, deployment)
-	if err != nil {
-		return err
-	}
-
-	c.recorder.Event(foo, corev1.EventTypeNormal, SuccessSynced, MessageResourceSynced)
 	return nil
+}
+
+func showFooName(returnedFoo *samplev1alpha1.Foo) string {
+	if returnedFoo != nil {
+		return returnedFoo.Name
+	}
+	return "<nil>"
 }
 
 func (c *Controller) updateFooStatus(foo *samplev1alpha1.Foo, deployment *appsv1.Deployment) error {

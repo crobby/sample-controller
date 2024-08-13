@@ -26,6 +26,10 @@ spec:
                   type: integer
                   minimum: 1
                   maximum: 10
+                IDs:
+                  type: array
+                  items:
+                    type: string
             status:
               type: object
               properties:
